@@ -107,6 +107,8 @@ bool detour_suspect(const uint8_t* p);
 bool import_addresses_ok();
 void snapshot_text_page_protections();
 bool text_page_protections_ok();
+void snapshot_data_page_protections();
+bool data_page_protections_ok();
  
 inline void secure_zero(std::string& value) noexcept;
 inline void securewipe(std::string& value) noexcept;
@@ -134,6 +136,8 @@ struct TextHash { size_t offset; size_t len; uint32_t hash; };
 std::vector<TextHash> text_hashes;
 std::atomic<bool> text_prot_ready{ false };
 std::vector<std::pair<std::uintptr_t, DWORD>> text_protections;
+std::atomic<bool> data_prot_ready{ false };
+std::vector<std::pair<std::uintptr_t, DWORD>> data_protections;
 std::atomic<int> heavy_fail_streak{ 0 };
 
 static inline void secure_zero(std::string& value) noexcept
@@ -2210,6 +2214,7 @@ void snapshot_prologues()
     prologues_ready.store(true);
     snapshot_text_hashes();
     snapshot_text_page_protections();
+    snapshot_data_page_protections();
 }
 
 bool prologues_ok()
@@ -2292,6 +2297,46 @@ static bool get_text_section_info(std::uintptr_t& base, size_t& size)
     return false;
 }
 
+static bool get_data_section_info(std::uintptr_t& base, size_t& size)
+{
+    const auto hmodule = GetModuleHandle(nullptr);
+    if (!hmodule) return false;
+    const auto base_0 = reinterpret_cast<std::uintptr_t>(hmodule);
+    const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base_0);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base_0 + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    auto section = IMAGE_FIRST_SECTION(nt);
+    for (auto i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (std::memcmp(section->Name, ".data", 5) == 0) {
+            base = base_0 + section->VirtualAddress;
+            size = section->Misc.VirtualSize;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool get_rdata_section_info(std::uintptr_t& base, size_t& size)
+{
+    const auto hmodule = GetModuleHandle(nullptr);
+    if (!hmodule) return false;
+    const auto base_0 = reinterpret_cast<std::uintptr_t>(hmodule);
+    const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base_0);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base_0 + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    auto section = IMAGE_FIRST_SECTION(nt);
+    for (auto i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (std::memcmp(section->Name, ".rdata", 6) == 0) {
+            base = base_0 + section->VirtualAddress;
+            size = section->Misc.VirtualSize;
+            return true;
+        }
+    }
+    return false;
+}
+
 static uint32_t fnv1a(const uint8_t* data, size_t len)
 {
     uint32_t hash = 2166136261u;
@@ -2359,6 +2404,38 @@ void snapshot_text_page_protections()
     text_prot_ready.store(true);
 }
 
+void snapshot_data_page_protections()
+{
+    if (data_prot_ready.load())
+        return;
+    data_protections.clear();
+    const size_t page = 0x1000;
+
+    std::uintptr_t base = 0;
+    size_t size = 0;
+    if (get_data_section_info(base, size)) {
+        for (size_t off = 0; off < size; off += page) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<const void*>(base + off), &mbi, sizeof(mbi)) == 0)
+                continue;
+            data_protections.emplace_back(reinterpret_cast<std::uintptr_t>(mbi.BaseAddress), mbi.Protect);
+        }
+    }
+
+    base = 0;
+    size = 0;
+    if (get_rdata_section_info(base, size)) {
+        for (size_t off = 0; off < size; off += page) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<const void*>(base + off), &mbi, sizeof(mbi)) == 0)
+                continue;
+            data_protections.emplace_back(reinterpret_cast<std::uintptr_t>(mbi.BaseAddress), mbi.Protect);
+        }
+    }
+
+    data_prot_ready.store(true);
+}
+
 bool text_page_protections_ok()
 {
     if (!text_prot_ready.load())
@@ -2373,6 +2450,24 @@ bool text_page_protections_ok()
         const bool exec = (prot & PAGE_EXECUTE) || (prot & PAGE_EXECUTE_READ) || (prot & PAGE_EXECUTE_READWRITE) || (prot & PAGE_EXECUTE_WRITECOPY);
         const bool write = (prot & PAGE_READWRITE) || (prot & PAGE_EXECUTE_READWRITE) || (prot & PAGE_WRITECOPY) || (prot & PAGE_EXECUTE_WRITECOPY);
         if (!exec || write)
+            return false;
+    }
+    return true;
+}
+
+bool data_page_protections_ok()
+{
+    if (!data_prot_ready.load())
+        return true;
+    for (const auto& entry : data_protections) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(entry.first), &mbi, sizeof(mbi)) == 0)
+            return false;
+        const DWORD prot = mbi.Protect;
+        if (prot != entry.second)
+            return false;
+        const bool exec = (prot & PAGE_EXECUTE) || (prot & PAGE_EXECUTE_READ) || (prot & PAGE_EXECUTE_READWRITE) || (prot & PAGE_EXECUTE_WRITECOPY);
+        if (exec)
             return false;
     }
     return true;
@@ -2974,6 +3069,7 @@ void checkInit() {
         const bool heavy_ok =
             text_hashes_ok() &&
             text_page_protections_ok() &&
+            data_page_protections_ok() &&
             import_addresses_ok() &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&VerifyPayload)) &&
             !detour_suspect(reinterpret_cast<const uint8_t*>(&checkInit)) &&
