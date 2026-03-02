@@ -1720,6 +1720,45 @@ void KeyAuth::api::logout() {
     load_response_data(json);
 }
 
+std::string KeyAuth::api::expiry_remaining(const std::string& expiry)
+{
+    if (expiry.empty())
+        return "unknown";
+    long long exp = 0;
+    try {
+        exp = std::stoll(expiry);
+    }
+    catch (...) {
+        return "unknown";
+    }
+    const long long now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    long long diff = exp - now;
+    if (diff <= 0)
+        return "expired";
+
+    const long long days = diff / 86400;
+    const long long weeks = days / 7;
+    const long long months = days / 30;
+    const long long hours = (diff % 86400) / 3600;
+    const long long minutes = (diff % 3600) / 60;
+
+    std::time_t tt = static_cast<std::time_t>(exp);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &tt);
+#else
+    tm = *std::localtime(&tt);
+#endif
+    char buf[32] = {};
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+
+    std::ostringstream out;
+    out << days << "d " << hours << "h " << minutes << "m remaining"
+        << " (expires " << buf << ", ~" << weeks << "w / " << months << "mo)";
+    return out.str();
+}
+
 int VerifyPayload(std::string signature, std::string timestamp, std::string body)
 {
     if (!prologues_ok()) {
@@ -2039,13 +2078,25 @@ bool timing_anomaly_detected()
     const auto steady_now = std::chrono::steady_clock::now();
     static auto wall_last = wall_now;
     static auto steady_last = steady_now;
+    static ULONGLONG tick_last = GetTickCount64();
+    static long long wall_last_sec = std::chrono::duration_cast<std::chrono::seconds>(
+        wall_now.time_since_epoch()).count();
     const auto wall_delta = std::chrono::duration_cast<std::chrono::seconds>(wall_now - wall_last).count();
     const auto steady_delta = std::chrono::duration_cast<std::chrono::seconds>(steady_now - steady_last).count();
     wall_last = wall_now;
     steady_last = steady_now;
+    const ULONGLONG tick_now = GetTickCount64();
+    const long long tick_delta = static_cast<long long>((tick_now - tick_last) / 1000ULL);
+    tick_last = tick_now;
+    const long long wall_now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+        wall_now.time_since_epoch()).count();
+    const long long wall_tick_delta = wall_now_sec - wall_last_sec;
+    wall_last_sec = wall_now_sec;
     if (wall_delta < -60 || wall_delta > 300)
         return true;
     if (std::llabs(wall_delta - steady_delta) > 120)
+        return true;
+    if (std::llabs(wall_tick_delta - tick_delta) > 120)
         return true;
     return false;
 }
@@ -2578,7 +2629,10 @@ void KeyAuth::api::debugInfo(std::string data, std::string url, std::string resp
             std::istream_iterator<std::string>());
 
         for (auto const& value : results) {
-            datas[value.substr(0, value.find('='))] = value.substr(value.find('=') + 1);
+            const auto pos = value.find('=');
+            if (pos == std::string::npos)
+                continue;
+            datas[value.substr(0, pos)] = value.substr(pos + 1);
         }
 
         RedactField(datas, "sessionid");

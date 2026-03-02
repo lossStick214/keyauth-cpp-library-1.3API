@@ -47,6 +47,7 @@ namespace KeyAuth {
 		void fetchstats();
 		void forgot(std::string username, std::string email);
 		void logout();
+		static std::string expiry_remaining(const std::string& expiry);
 
 		class subscriptions_class {
 		public:
@@ -113,22 +114,27 @@ namespace KeyAuth {
 		
 
 		void load_user_data(nlohmann::json data) {
-			api::user_data.username = data[XorStr("username")];
-			api::user_data.ip = data[XorStr("ip")];
-			if (data[XorStr("hwid")].is_null()) {
+			api::user_data.username = data.value(XorStr("username"), "");
+			api::user_data.ip = data.value(XorStr("ip"), "");
+			if (!data.contains(XorStr("hwid")) || data[XorStr("hwid")].is_null()) {
 				api::user_data.hwid = XorStr("none");
 			}
 			else {
 				api::user_data.hwid = data[XorStr("hwid")];
 			}
-			api::user_data.createdate = data[XorStr("createdate")];
-			api::user_data.lastlogin = data[XorStr("lastlogin")];
+			api::user_data.createdate = data.value(XorStr("createdate"), "");
+			api::user_data.lastlogin = data.value(XorStr("lastlogin"), "");
 
-			for (size_t i = 0; i < data[XorStr("subscriptions")].size(); i++) { // Prompto#7895 & stars#2297 was here
-				subscriptions_class subscriptions;
-				subscriptions.name = data[XorStr("subscriptions")][i][XorStr("subscription")];
-				subscriptions.expiry = data[XorStr("subscriptions")][i][XorStr("expiry")];
-				api::user_data.subscriptions.emplace_back(subscriptions);
+			api::user_data.subscriptions.clear();
+			if (data.contains(XorStr("subscriptions")) && data[XorStr("subscriptions")].is_array()) {
+				for (const auto& sub : data[XorStr("subscriptions")]) {
+					subscriptions_class subscriptions;
+					if (sub.contains(XorStr("subscription")))
+						subscriptions.name = sub.value(XorStr("subscription"), "");
+					if (sub.contains(XorStr("expiry")))
+						subscriptions.expiry = sub.value(XorStr("expiry"), "");
+					api::user_data.subscriptions.emplace_back(subscriptions);
+				}
 			}
 		}
 
@@ -157,10 +163,12 @@ namespace KeyAuth {
 				return; // avoid invalid server payload crash. -nigel
 			}
 			for (const auto& sub : data["messages"]) {
-
-				std::string authoroutput = sub[XorStr("author")];
-				std::string messageoutput = sub["message"];
-				int timestamp = sub[XorStr("timestamp")]; std::string timestampoutput = std::to_string(timestamp);
+				if (!sub.is_object())
+					continue;
+				std::string authoroutput = sub.value(XorStr("author"), "");
+				std::string messageoutput = sub.value("message", "");
+				const int timestamp = sub.value(XorStr("timestamp"), 0);
+				std::string timestampoutput = std::to_string(timestamp);
 				authoroutput.erase(remove(authoroutput.begin(), authoroutput.end(), '"'), authoroutput.end());
 				messageoutput.erase(remove(messageoutput.begin(), messageoutput.end(), '"'), messageoutput.end());
 				timestampoutput.erase(remove(timestampoutput.begin(), timestampoutput.end(), '"'), timestampoutput.end());
