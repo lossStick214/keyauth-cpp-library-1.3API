@@ -2,6 +2,9 @@
 #include <xorstr.hpp>
 #include <random>
 #include <chrono>
+#include <atomic>
+#include <thread>
+#include <functional>
 
 #define CURL_STATICLIB 
 
@@ -48,6 +51,10 @@ namespace KeyAuth {
 		void fetchstats();
 		void forgot(std::string username, std::string email);
 		void logout();
+		void start_ban_monitor(int interval_seconds = 45, bool check_session = false, std::function<void()> on_ban = {});
+		void stop_ban_monitor();
+		bool ban_monitor_running() const;
+		bool ban_monitor_detected() const;
 		static std::string expiry_remaining(const std::string& expiry);
 		static constexpr const char* kSavePath = "test.json";
 		static constexpr int kInitFailSleepMs = 1500;
@@ -213,6 +220,10 @@ namespace KeyAuth {
 				api::response.channeldata.push_back(output);
 			}
 		}
+
+		std::atomic<bool> ban_monitor_running_{ false };
+		std::atomic<bool> ban_monitor_detected_{ false };
+		std::thread ban_monitor_thread_;
 
 		nlohmann::json response_decoder;
 

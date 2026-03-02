@@ -161,3 +161,17 @@ of the licensor in the software. Any use of the licensor’s trademarks is subje
 to applicable law.
 
 Thank you for your compliance, we work hard on the development of KeyAuth and do not appreciate our copyright being infringed.
+
+## Live ban monitor (threaded)
+
+Optional background check that polls every 45 seconds. Always stop it before exiting.
+
+```cpp
+KeyAuthApp.start_ban_monitor(45, false, [] {
+    std::cout << "Blacklisted, exiting..." << std::endl;
+    exit(0);
+});
+
+// later, before exit
+KeyAuthApp.stop_ban_monitor();
+```

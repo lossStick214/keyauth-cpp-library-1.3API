@@ -1726,6 +1726,56 @@ void KeyAuth::api::logout() {
     load_response_data(json);
 }
 
+void KeyAuth::api::start_ban_monitor(int interval_seconds, bool check_session, std::function<void()> on_ban)
+{
+    if (ban_monitor_running_) {
+        return;
+    }
+
+    if (interval_seconds < 1) {
+        interval_seconds = 1;
+    }
+
+    ban_monitor_detected_ = false;
+    ban_monitor_running_ = true;
+    ban_monitor_thread_ = std::thread([this, interval_seconds, check_session, on_ban]() {
+        while (ban_monitor_running_) {
+            if (check_session) {
+                this->check(false);
+            }
+
+            if (this->checkblack()) {
+                ban_monitor_detected_ = true;
+                ban_monitor_running_ = false;
+                if (on_ban) {
+                    on_ban();
+                }
+                return;
+            }
+
+            std::this_thread::sleep_for(std::chrono::seconds(interval_seconds));
+        }
+    });
+}
+
+void KeyAuth::api::stop_ban_monitor()
+{
+    ban_monitor_running_ = false;
+    if (ban_monitor_thread_.joinable()) {
+        ban_monitor_thread_.join();
+    }
+}
+
+bool KeyAuth::api::ban_monitor_running() const
+{
+    return ban_monitor_running_.load();
+}
+
+bool KeyAuth::api::ban_monitor_detected() const
+{
+    return ban_monitor_detected_.load();
+}
+
 std::string KeyAuth::api::expiry_remaining(const std::string& expiry)
 {
     if (expiry.empty())
