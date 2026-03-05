@@ -153,6 +153,13 @@ std::vector<std::pair<std::uintptr_t, DWORD>> text_protections;
 std::atomic<bool> data_prot_ready{ false };
 std::vector<std::pair<std::uintptr_t, DWORD>> data_protections;
 std::atomic<int> heavy_fail_streak{ 0 };
+static const char* kCriticalImports[] = {
+    "WinVerifyTrust",
+    "WinHttpGetDefaultProxyConfiguration",
+    "WinHttpSendRequest",
+    "WinHttpReceiveResponse",
+    "CryptVerifyMessageSignature",
+};
 static std::atomic<uint32_t> text_crc_baseline{ 0 };
 
 static inline void secure_zero(std::string& value) noexcept
@@ -2869,17 +2876,35 @@ static bool iat_hook_suspect(const char* dll_name, const char* func_name)
 static bool get_export_address(HMODULE mod, const char* name, void*& out_addr)
 {
     out_addr = nullptr;
-    if (!mod) return false;
+    if (!mod || !name)
+        return false;
     auto base = reinterpret_cast<uint8_t*>(mod);
     auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + does-e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
 
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (!dir.VirtualAddress) return false;
+    if (!dir.VirtualAddress)
+        return false;
 
-    auto exp = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>
+    auto exp = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+    auto names = reinterpret_cast<DWORD*>(base + exp->AddressOfNames);
+    auto funcs = reinterpret_cast<DWORD*>(base + exp->AddressOfFunctions);
+    auto ords = reinterpret_cast<WORD*>(base + exp->AddressOfNameOrdinals);
+
+    for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+        const char* n = reinterpret_cast<const char*>(base + names[i]);
+        if (_stricmp(n, name) == 0) {
+            WORD ord = ords[i];
+            DWORD rva = funcs[ord];
+            out_addr = base + rva;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool import_addresses_ok()
@@ -2933,6 +2958,42 @@ static bool iat_get_import_address(HMODULE module, const char* import_name, void
                 out_addr = reinterpret_cast<void*>(thunk->u1.Function);
                 return true;
             }
+        }
+    }
+    return true;
+}
+
+static bool iat_points_outside_module(HMODULE module, const char* func_name)
+{
+    if (!module || !func_name)
+        return false;
+
+    void* addr = nullptr;
+    bool found = false;
+    if (!iat_get_import_address(module, func_name, addr, found) || !found)
+        return false;
+
+    HMODULE owner = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(addr), &owner)) {
+        return true;
+    }
+
+    if (!addr_in_module_handle(addr, owner))
+        return true;
+
+    return false;
+}
+
+static bool iat_integrity_ok()
+{
+    HMODULE self = GetModuleHandle(nullptr);
+    if (!self)
+        return false;
+
+    for (const char* name : kCriticalImports) {
+        if (iat_points_outside_module(self, name)) {
+            return false;
         }
     }
     return true;
@@ -3656,6 +3717,11 @@ void checkInit() {
             iat_hook_suspect("WINTRUST.dll", "WinVerifyTrust")) {
             error(XorStr("iat hook detected."));
         }
+
+        if (!iat_integrity_ok()) {
+            error(XorStr("iat integrity check failed."));
+        }
+
 periodic_done:
         if (check_section_integrity(XorStr(".text").c_str(), false)) {
             const int streak = integrity_fail_streak.fetch_add(1) + 1;
