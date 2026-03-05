@@ -110,6 +110,9 @@ bool core_modules_signed();
 static std::wstring get_system_dir();
 static std::wstring get_syswow_dir();
 void snapshot_prologues();
+static void snapshot_checkinit();
+static bool checkinit_ok();
+static void security_watchdog();
 bool prologues_ok();
 bool func_region_ok(const void* addr);
 bool timing_anomaly_detected();
@@ -212,8 +215,8 @@ void KeyAuth::api::init()
     seed = generate_random_number();
     std::atexit([]() { cleanUpSeedData(seed); });
 
-    if (!secrutiy_watchdog.exchange(true)) {
-     std::thread(security_watchdog).detach();
+    if (!watchdog_started.exchange(true)) {
+        std::thread(security_watchdog).detach();
     }
 
     CreateThread(0, 0, (LPTHREAD_START_ROUTINE)modify, 0, 0, 0);
@@ -2436,7 +2439,84 @@ static std::wstring get_syswow_dir()
     return std::wstring(buf);
 }
 
-static std::wstring normalize_path(std::string p)
+static std::wstring normalize_path(std::wstring p)
+{
+    std::transform(p.begin(), p.end(), p.begin(),
+        [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+    while (!p.empty() && (p.back() == L'\\' || p.back() == L'/')) {
+        p.pop_back();
+    }
+    return p;
+}
+
+static bool get_module_path(HMODULE mod, std::wstring& out)
+{
+    wchar_t path[MAX_PATH] = {};
+    if (!mod)
+        return false;
+    if (!GetModuleFileNameW(mod, path, MAX_PATH))
+        return false;
+    out.assign(path);
+    return true;
+}
+
+static bool module_in_system32(HMODULE mod)
+{
+    std::wstring mod_path;
+    if (!get_module_path(mod, mod_path))
+        return false;
+    mod_path = normalize_path(mod_path);
+
+    std::wstring sys = normalize_path(get_system_dir());
+    if (sys.empty())
+        return false;
+
+    return mod_path.rfind(sys + L"\\", 0) == 0;
+}
+
+static uint32_t file_crc32(const std::wstring& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f.good()) return 0;
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (buf.empty()) return 0;
+
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint8_t b : buf) {
+        crc ^= b;
+        for (int k = 0; k < 8; ++k) {
+            uint32_t mask = (crc & 1u) ? 0xFFFFFFFFu : 0u;
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
+static bool critical_modules_safe()
+{
+    const wchar_t* system_mods[] = { L"wintrust.dll", L"crypt32.dll", L"bcrypt.dll" };
+    for (const auto* name : system_mods) {
+        HMODULE mod = GetModuleHandleW(name);
+        if (!mod) return false;
+        if (!module_in_system32(mod)) return false;
+    }
+
+    const wchar_t* app_mods[] = { L"libcurl.dll", L"libsodium.dll" };
+    for (const auto* name : app_mods) {
+        HMODULE mod = GetModuleHandleW(name);
+        if (!mod) continue;
+        std::wstring path;
+        if (!get_module_path(mod, path)) return false;
+        std::wstring p = normalize_path(path);
+
+        if (p.find(L"\\appdata\\") != std::wstring::npos ||
+            p.find(L"\\temp\\") != std::wstring::npos ||
+            p.find(L"\\downloads\\") != std::wstring::npos) {
+            return false;
+        }
+    }
+    return true;
+}
 
 void snapshot_prologues()
 {
@@ -2797,40 +2877,6 @@ static bool addr_in_module_handle(const void* addr, HMODULE mod)
     const auto base = reinterpret_cast<const uint8_t*>(mi.lpBaseOfDll);
     const auto end = base + mi.SizeOfImage;
     return addr >= base && addr < end;
-}
-
-static bool get_export_address(HMODULE mod, const char* name, void*& out_addr)
-{
-    out_addr = nullptr;
-    if (!mod || !name)
-        return false;
-    auto base = reinterpret_cast<uint8_t*>(mod);
-    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return false;
-    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE)
-        return false;
-
-    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (!dir.VirtualAddress)
-        return false;
-
-    auto exp = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
-    auto names = reinterpret_cast<DWORD*>(base + exp->AddressOfNames);
-    auto funcs = reinterpret_cast<DWORD*>(base + exp->AddressOfFunctions);
-    auto ords = reinterpret_cast<WORD*>(base + exp->AddressOfNameOrdinals);
-
-    for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
-        const char* n = reinterpret_cast<const char*>(base + names[i]);
-        if (_stricmp(n, name) == 0) {
-            WORD ord = ords[i];
-            DWORD rva = funcs[ord];
-            out_addr = base + rva;
-            return true;
-        }
-    }
-    return false;
 }
 
 static bool export_mismatch(const char* dll, const char* func)
