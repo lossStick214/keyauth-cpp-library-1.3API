@@ -233,6 +233,18 @@ static std::string to_lower_ascii(std::string v)
     return v;
 }
 
+static std::string wide_to_utf8(const wchar_t* w)
+{
+    if (!w)
+        return {};
+    int needed = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (needed <= 0)
+        return {};
+    std::string out(static_cast<size_t>(needed - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
 static bool list_contains_any(const std::string& hay, const std::vector<std::string>& needles)
 {
     for (const auto& n : needles) {
@@ -260,7 +272,7 @@ static bool suspicious_processes_present()
         return false;
     }
     do {
-        std::string name = to_lower_ascii(pe.szExeFile);
+        std::string name = to_lower_ascii(wide_to_utf8(pe.szExeFile));
         if (list_contains_any(name, bad)) {
             CloseHandle(snap);
             return true;
@@ -2386,17 +2398,6 @@ static bool is_https_url(const std::string& url)
             return false;
     }
     return true;
-}
-
-static bool proxy_env_set()
-{
-    const char* keys[] = { "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy" };
-    for (const char* k : keys) {
-        const char* v = std::getenv(k);
-        if (v && *v)
-            return true;
-    }
-    return false;
 }
 
 static bool winhttp_proxy_set()
