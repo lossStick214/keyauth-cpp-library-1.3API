@@ -2646,7 +2646,7 @@ static bool get_text_section_info(std::uintptr_t& base, size_t& size)
     return false;
 }
 
-static uint32_t rolling_crc32(const uint8_t* data, size_t len, size_t window = 64, size_t stride = 16)
+static uint32_t rolling_crc32(const uint8_t* data, size_t len, size_t window, size_t stride)
 {
     if (!data || len < window)
         return 0;
