@@ -153,7 +153,7 @@ std::vector<std::pair<std::uintptr_t, DWORD>> text_protections;
 std::atomic<bool> data_prot_ready{ false };
 std::vector<std::pair<std::uintptr_t, DWORD>> data_protections;
 std::atomic<int> heavy_fail_streak{ 0 };
-static std::atomic<uint32_t> text_crc_baseline{ 0 };
+static std::atomic<uint32_t> text_crc_baseline{ 0 }; // base for rolling_crc check
 
 static inline void secure_zero(std::string& value) noexcept
 {
@@ -1887,16 +1887,6 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
         error(XorStr("function prologue check failed, possible inline hook detected."));
     }
     integrity_check();
-    if (timestamp.size() < 10 || timestamp.size() > 13) {
-        MessageBoxA(0, "Signature verification failed (timestamp length)", "KeyAuth", MB_ICONERROR);
-        exit(2);
-    }
-    for (char c : timestamp) {
-        if (c < '0' || c > '9') {
-            MessageBoxA(0, "Signature verification failed (timestamp format)", "KeyAuth", MB_ICONERROR);
-            exit(2);
-        }
-    }
     long long unix_timestamp = 0;
     try {
         unix_timestamp = std::stoll(timestamp);
@@ -1930,10 +1920,6 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     unsigned char sig[64];
     unsigned char pk[32];
 
-    if (signature.size() != 128) {
-        MessageBoxA(0, "Signature verification failed (sig length)", "KeyAuth", MB_ICONERROR);
-        exit(5);
-    }
     if (sodium_hex2bin(sig, sizeof(sig), signature.c_str(), signature.length(), NULL, NULL, NULL) != 0) {
         std::cerr << "[ERROR] Failed to parse signature hex.\n";
         MessageBoxA(0, "Signature verification failed (invalid signature format)", "KeyAuth", MB_ICONERROR);
@@ -2304,7 +2290,7 @@ bool hosts_override_present(const std::string& host)
 			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
 		// word check example, this can always be improved
-		if (line.find(" " + host_lower) != std:string::npos || line.find("\t" + host_lower) != std::string::npos)
+		if (line.find(" " + host_lower) != std::string::npos || line.find("\t" + host_lower) != std::string::npos)
 			return true;
 	}
 	return false;
@@ -2417,6 +2403,44 @@ static std::wstring get_syswow_dir()
     return std::wstring(buf);
 }
 
+// helper for check_section_integrity
+static uint32_t rolling_crc32(const uint8_t* data, size_t len, size_t window = 64, size_t stride = 16)
+{
+    if (!data || len < window)
+        return 0;
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i + window <= len; i += stride) {
+        for (size_t j = 0; j < window; ++j) {
+            uint8_t b = data[i + j];
+            crc ^= b;
+            for (int k = 0; k < 8; ++k) {
+                uint32_t mask = (crc & 1u) ? 0xFFFFFFFFu : 0u;
+                crc = (crc >> 1) ^ (0xEDB88320u & mask);
+            }
+        }
+    }
+    return ~crc;
+}
+
+static bool get_text_section_info(std::uintptr_t& base, size_t& size)
+{
+    const auto hmodule = GetModuleHandle(nullptr);
+    if (!hmodule) return false;
+    const auto base_0 = reinterpret_cast<std::uintptr_t>(hmodule);
+    const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base_0);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base_0 + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    auto section = IMAGE_FIRST_SECTION(nt);
+    for (auto i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (std::memcmp(section->Name, ".text", 5) == 0) {
+            base = base_0 + section->VirtualAddress;
+            size = section->Misc.VirtualSize;
+            return true;
+        }
+    }
+    return false;
+}
 
 void snapshot_prologues()
 {
@@ -2434,16 +2458,14 @@ void snapshot_prologues()
     std::memcpy(pro_section.data(), section_ptr, pro_section.size());
     prologues_ready.store(true);
     snapshot_text_hashes();
+	std::uintptr_t text_base = 0;
+	size_t text_size = 0;
+	if (get_text_section_info(text_base, text_size) && text_base && text_size) {
+		const auto* text_ptr = reinterpret_cast<const uint8_t*>(text_base);
+		text_crc_baseline.store(rolling_crc32(text_ptr, text_size));
+	}
     snapshot_text_page_protections();
     snapshot_data_page_protections();
-    {
-        std::uintptr_t text_base = 0;
-        size_t text_size = 0;
-        if (get_text_section_info(text_base, text_size) && text_base && text_size) {
-            const auto* text_ptr = reinterpret_cast<const uint8_t*>(text_base);
-            text_crc_baseline.store(rolling_crc32(text_ptr, text_size));
-        }
-    }
 }
 
 bool prologues_ok()
@@ -2504,44 +2526,6 @@ bool timing_anomaly_detected()
     if (std::llabs(wall_tick_delta - tick_delta) > 120)
         return true;
     return false;
-}
-
-static bool get_text_section_info(std::uintptr_t& base, size_t& size)
-{
-    const auto hmodule = GetModuleHandle(nullptr);
-    if (!hmodule) return false;
-    const auto base_0 = reinterpret_cast<std::uintptr_t>(hmodule);
-    const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base_0);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    const auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base_0 + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-    auto section = IMAGE_FIRST_SECTION(nt);
-    for (auto i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
-        if (std::memcmp(section->Name, ".text", 5) == 0) {
-            base = base_0 + section->VirtualAddress;
-            size = section->Misc.VirtualSize;
-            return true;
-        }
-    }
-    return false;
-}
-
-static uint32_t rolling_crc32(const uint8_t* data, size_t len, size_t window = 64, size_t stride = 16)
-{
-    if (!data || len < window)
-        return 0;
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i + window <= len; i += stride) {
-        for (size_t j = 0; j < window; ++j) {
-            uint8_t b = data[i + j];
-            crc ^= b;
-            for (int k = 0; k < 8; ++k) {
-                uint32_t mask = (crc & 1u) ? 0xFFFFFFFFu : 0u;
-                crc = (crc >> 1) ^ (0xEDB88320u & mask);
-            }
-        }
-    }
-    return ~crc;
 }
 
 static bool get_data_section_info(std::uintptr_t& base, size_t& size)
@@ -2963,12 +2947,6 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         }
     }
 
-    if (signature.empty() || signatureTimestamp.empty()) {
-        if (req_headers) curl_slist_free_all(req_headers);
-        curl_easy_cleanup(curl);
-        error(XorStr("missing signature headers."));
-    }
-
     char* effective_url = nullptr;
     if (curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url) == CURLE_OK && effective_url) {
         if (!is_https_url(effective_url)) {
@@ -3024,11 +3002,6 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         if (req_headers) curl_slist_free_all(req_headers);
         curl_easy_cleanup(curl);
         error(XorStr("response too large."));
-    }
-    if (to_return.size() < 32) {
-        if (req_headers) curl_slist_free_all(req_headers);
-        curl_easy_cleanup(curl);
-        error(XorStr("response too small."));
     }
     if (req_headers) curl_slist_free_all(req_headers);
     curl_easy_cleanup(curl);
@@ -3416,18 +3389,16 @@ void checkInit() {
         } else {
             heavy_fail_streak.store(0);
         }
-        {
-            std::uintptr_t text_base = 0;
-            size_t text_size = 0;
-            if (get_text_section_info(text_base, text_size) && text_base && text_size) {
-                const auto* text_ptr = reinterpret_cast<const uint8_t*>(text_base);
-                const uint32_t crc_now = rolling_crc32(text_ptr, text_size);
-                const uint32_t crc_base = text_crc_baseline.load();
-                if (crc_base != 0 && crc_now != crc_base) {
-                    error(XorStr(".text rolling crc mismatch."));
-                }
-            }
-        }
+		std::uintptr_t text_base = 0;
+		size_t text_size = 0;
+		if (get_text_section_info(text_base, text_size) && text_base && text_size) {
+			const auto* text_ptr = reinterpret_cast<const uint8_t*>(text_base);
+			const uint32_t crc_now = rolling_crc32(text_ptr, text_size);
+			const uint32_t crc_base = text_crc_baseline.load();
+			if (crc_base != 0 && crc_now != crc_base) {
+				error(XorStr(".text rolling crc mismatch"));
+			}
+		}
 periodic_done:
         if (check_section_integrity(XorStr(".text").c_str(), false)) {
             const int streak = integrity_fail_streak.fetch_add(1) + 1;
