@@ -1887,6 +1887,16 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
         error(XorStr("function prologue check failed, possible inline hook detected."));
     }
     integrity_check();
+    if (timestamp.size() < 10 || timestamp.size() > 13) {
+        MessageBoxA(0, "Signature verification failed (timestamp length)", "KeyAuth", MB_ICONERROR);
+        exit(2);
+    }
+    for (char c : timestamp) {
+        if (c < '0' || c > '9') {
+            MessageBoxA(0, "Signature verification failed (timestamp format)", "KeyAuth", MB_ICONERROR);
+            exit(2);
+        }
+    }
     long long unix_timestamp = 0;
     try {
         unix_timestamp = std::stoll(timestamp);
@@ -1920,6 +1930,10 @@ int VerifyPayload(std::string signature, std::string timestamp, std::string body
     unsigned char sig[64];
     unsigned char pk[32];
 
+    if (signature.size() != 128) {
+        MessageBoxA(0, "Signature verification failed (sig length)", "KeyAuth", MB_ICONERROR);
+        exit(5);
+    }
     if (sodium_hex2bin(sig, sizeof(sig), signature.c_str(), signature.length(), NULL, NULL, NULL) != 0) {
         std::cerr << "[ERROR] Failed to parse signature hex.\n";
         MessageBoxA(0, "Signature verification failed (invalid signature format)", "KeyAuth", MB_ICONERROR);
@@ -2949,6 +2963,12 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         }
     }
 
+    if (signature.empty() || signatureTimestamp.empty()) {
+        if (req_headers) curl_slist_free_all(req_headers);
+        curl_easy_cleanup(curl);
+        error(XorStr("missing signature headers."));
+    }
+
     char* effective_url = nullptr;
     if (curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url) == CURLE_OK && effective_url) {
         if (!is_https_url(effective_url)) {
@@ -3004,6 +3024,11 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         if (req_headers) curl_slist_free_all(req_headers);
         curl_easy_cleanup(curl);
         error(XorStr("response too large."));
+    }
+    if (to_return.size() < 32) {
+        if (req_headers) curl_slist_free_all(req_headers);
+        curl_easy_cleanup(curl);
+        error(XorStr("response too small."));
     }
     if (req_headers) curl_slist_free_all(req_headers);
     curl_easy_cleanup(curl);
