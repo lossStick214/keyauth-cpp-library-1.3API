@@ -2750,6 +2750,138 @@ static bool addr_in_module(const void* addr, const wchar_t* module_name)
     return addr >= base && addr < end;
 }
 
+static bool addr_in_module_handle(const void* addr, HMODULE mod)
+{
+    if (!mod)
+        return false;
+    MODULEINFO mi{};
+    if (!GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi)))
+        return false;
+    const auto base = reinterpret_cast<const uint8_t*>(mi.lpBaseOfDll);
+    const auto end = base + mi.SizeOfImage;
+    return addr >= base && addr < end;
+}
+
+static bool get_export_address(HMODULE mod, const char* name, void*& out_addr)
+{
+    out_addr = nullptr;
+    if (!mod || !name)
+        return false;
+    auto base = reinterpret_cast<uint8_t*>(mod);
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
+
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress)
+        return false;
+
+    auto exp = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+    auto names = reinterpret_cast<DWORD*>(base + exp->AddressOfNames);
+    auto funcs = reinterpret_cast<DWORD*>(base + exp->AddressOfFunctions);
+    auto ords = reinterpret_cast<WORD*>(base + exp->AddressOfNameOrdinals);
+
+    for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+        const char* n = reinterpret_cast<const char*>(base + names[i]);
+        if (_stricmp(n, name) == 0) {
+            WORD ord = ords[i];
+            DWORD rva = funcs[ord];
+            out_addr = base + rva;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool export_mismatch(const char* dll, const char* func)
+{
+    HMODULE mod = GetModuleHandleA(dll);
+    if (!mod)
+        return false;
+
+    void* by_export = nullptr;
+    if (!get_export_address(mod, func, by_export))
+        return false;
+
+    void* by_proc = GetProcAddress(mod, func);
+    if (!by_proc)
+        return false;
+
+    return by_export != by_proc;
+}
+
+static bool hotpatch_prologue_present(const void* fn)
+{
+    if (!fn)
+        return false;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
+    if (p[0] == 0x8B && p[1] == 0xFF) return true; // mov edi, edi
+    if (p[0] == 0x90 && p[1] == 0x90 && p[2] == 0x90 && p[3] == 0x90 && p[4] == 0x90) return true;
+    return false;
+}
+
+static bool ntdll_syscall_stub_tampered(const char* name)
+{
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll || !name)
+        return false;
+    void* fn = GetProcAddress(ntdll, name);
+    if (!fn)
+        return false;
+
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
+#ifdef _WIN64
+    if (!(p[0] == 0x4C && p[1] == 0x8B && p[2] == 0xD1)) return true;
+    if (!(p[3] == 0xB8)) return true;
+    if (!(p[8] == 0x0F && p[9] == 0x05)) return true;
+    if (!(p[10] == 0xC3)) return true;
+#endif
+    return false;
+}
+
+static bool nearby_trampoline_present(const void* fn)
+{
+    if (!fn)
+        return false;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
+    for (int i = -32; i <= 32; ++i) {
+        const uint8_t* q = p + i;
+        if (q[0] == 0xE9) return true; // jmp rel32
+        if (q[0] == 0xFF && q[1] == 0x25) return true; // jmp [rip+imm32]
+    }
+    return false;
+}
+
+static bool iat_hook_suspect(const char* dll_name, const char* func_name)
+{
+    HMODULE mod = GetModuleHandleA(dll_name);
+    if (!mod || !func_name)
+        return false;
+    void* addr = GetProcAddress(mod, func_name);
+    if (!addr)
+        return false;
+    return !addr_in_module_handle(addr, mod);
+}
+
+static bool get_export_address(HMODULE mod, const char* name, void*& out_addr)
+{
+    out_addr = nullptr;
+    if (!mod) return false;
+    auto base = reinterpret_cast<uint8_t*>(mod);
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + does-e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress) return false;
+
+    auto exp = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>
+}
+
 bool import_addresses_ok()
 {
     // wintrust functions should resolve inside wintrust.dll when loaded
@@ -3495,6 +3627,35 @@ void checkInit() {
         if (!compare_text_to_disk()) {
             error(XorStr("memory .text mismatch vs disk image."));
         }
+
+        if (export_mismatch("KERNEL32.dll", "LoadLibraryA") ||
+            export_mismatch("KERNEL32.dll", "GetProcAddress") ||
+            export_mismatch("WINHTTP.dll", "WinHttpGetDefaultProxyConfiguration") ||
+            export_mismatch("WINTRUST.dll", "WinVerifyTrust")) {
+            error(XorStr("export mismatch detected."));
+        }
+
+        if (hotpatch_prologue_present(&WinVerifyTrust) ||
+            hotpatch_prologue_present(&WinHttpGetDefaultProxyConfiguration)) {
+            error(XorStr("hotpatch prologue detected."));
+        }
+
+        if (ntdll_syscall_stub_tampered("NtQueryInformationProcess") ||
+            ntdll_syscall_stub_tampered("NtProtectVirtualMemory")) {
+            error(XorStr("ntdll syscall stub tampered."));
+        }
+
+        if (nearby_trampoline_present(&curl_easy_perform) ||
+            nearby_trampoline_present(&curl_easy_setopt)) {
+            error(XorStr("trampoline near api detected."));
+        }
+
+        if (iat_hook_suspect("KERNEL32.dll", "LoadLibraryA") ||
+            iat_hook_suspect("KERNEL32.dll", "GetProcAddress") ||
+            iat_hook_suspect("WINHTTP.dll", "WinHttpGetDefaultProxyConfiguration") ||
+            iat_hook_suspect("WINTRUST.dll", "WinVerifyTrust")) {
+            error(XorStr("iat hook detected."));
+        }
 periodic_done:
         if (check_section_integrity(XorStr(".text").c_str(), false)) {
             const int streak = integrity_fail_streak.fetch_add(1) + 1;
@@ -3559,12 +3720,10 @@ DWORD64 FindPattern(BYTE* bMask, const char* szMask)
 DWORD64 Function_Address;
 void modify()
 {
-    // code submitted in pull request from https://github.com/Roblox932
     check_section_integrity( XorStr( ".text" ).c_str( ), true );
 
     while (true)
     {
-        // new code by https://github.com/LiamG53
         #if KEYAUTH_HAVE_KILLEMU
         protection::init();
         #endif
