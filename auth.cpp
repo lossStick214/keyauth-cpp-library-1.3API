@@ -3561,12 +3561,57 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         error(XorStr("missing signature headers."));
     }
 
+    if (signature.size() != 128 || !std::all_of(signature.begin(), signature.end(),
+        [](unsigned char c) { return std::isxdigit(c) != 0; })) {
+        if (req_headers) curl_slist_free_all(req_headers);
+        curl_easy_cleanup(curl);
+        error(XorStr("invalid signature header format."));
+    }
+
+    if (signatureTimestamp.size() < 10 || signatureTimestamp.size() > 13 ||
+        !std::all_of(signatureTimestamp.begin(), signatureTimestamp.end(),
+            [](unsigned char c) { return c >= '0' && c <= '9'; })) {
+        if (req_headers) curl_slist_free_all(req_headers);
+        curl_easy_cleanup(curl);
+        error(XorStr("invalid signature timestamp header format."));
+    }
+
     // Enforce cryptographic payload verification on every request path.
     const int verify_result = VerifyPayload(signature, signatureTimestamp, to_return);
     if ((verify_result & 0xFFFF) != ((42 ^ 0xA5A5) & 0xFFFF)) {
         if (req_headers) curl_slist_free_all(req_headers);
         curl_easy_cleanup(curl);
         error(XorStr("payload verification marker mismatch."));
+    }
+
+    // Independent verification path so hooking one verifier is insufficient.
+    if (sodium_init() < 0) {
+        if (req_headers) curl_slist_free_all(req_headers);
+        curl_easy_cleanup(curl);
+        error(XorStr("libsodium init failed in request guard."));
+    }
+
+    unsigned char sig_guard[64] = { 0 };
+    unsigned char pk_guard[32] = { 0 };
+    if (sodium_hex2bin(sig_guard, sizeof(sig_guard), signature.c_str(), signature.size(), nullptr, nullptr, nullptr) != 0) {
+        if (req_headers) curl_slist_free_all(req_headers);
+        curl_easy_cleanup(curl);
+        error(XorStr("signature decode failed in request guard."));
+    }
+    const std::string pubkey_hex_guard = get_public_key_hex();
+    if (sodium_hex2bin(pk_guard, sizeof(pk_guard), pubkey_hex_guard.c_str(), pubkey_hex_guard.size(), nullptr, nullptr, nullptr) != 0) {
+        if (req_headers) curl_slist_free_all(req_headers);
+        curl_easy_cleanup(curl);
+        error(XorStr("public key decode failed in request guard."));
+    }
+    const std::string signed_message_guard = signatureTimestamp + to_return;
+    if (crypto_sign_ed25519_verify_detached(sig_guard,
+        reinterpret_cast<const unsigned char*>(signed_message_guard.data()),
+        signed_message_guard.size(),
+        pk_guard) != 0) {
+        if (req_headers) curl_slist_free_all(req_headers);
+        curl_easy_cleanup(curl);
+        error(XorStr("signature verify failed in request guard."));
     }
 
     char* effective_url = nullptr;
