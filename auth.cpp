@@ -287,7 +287,7 @@ static bool suspicious_modules_present()
 {
     const std::vector<std::string> bad = {
         "fiddlercore", "mitm", "charles", "httpdebugger", "proxifier",
-        "detours"
+        "detours", "minhook", "easyhook", "polyhook", "bypass", "inject", "hook"
     };
     HMODULE mods[1024];
     DWORD needed = 0;
@@ -3559,6 +3559,14 @@ std::string KeyAuth::api::req(std::string data, const std::string& url) {
         if (req_headers) curl_slist_free_all(req_headers);
         curl_easy_cleanup(curl);
         error(XorStr("missing signature headers."));
+    }
+
+    // Enforce cryptographic payload verification on every request path.
+    const int verify_result = VerifyPayload(signature, signatureTimestamp, to_return);
+    if ((verify_result & 0xFFFF) != ((42 ^ 0xA5A5) & 0xFFFF)) {
+        if (req_headers) curl_slist_free_all(req_headers);
+        curl_easy_cleanup(curl);
+        error(XorStr("payload verification marker mismatch."));
     }
 
     char* effective_url = nullptr;
